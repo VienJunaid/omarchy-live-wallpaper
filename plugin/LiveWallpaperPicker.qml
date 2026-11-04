@@ -119,20 +119,33 @@ Item {
     }
   }
 
-  // The selected card's video starts once the slide animation has settled, so flicking through
-  // the carousel doesn't spin up a decoder for every card passed on the way.
+  // The selected card's video (and its gold frame, which sits fixed over the middle slot) only
+  // appears once the slide animation has fully finished AND the selected scene's own video is the
+  // one playing. Every step re-checks both, so a late "playing" signal from the previous video, or
+  // a reveal that was already scheduled, can never show the frame while a card is still moving.
   onSelectedIndexChanged: restartPreview()
   function restartPreview() {
     videoShown = false
+    fadeInDelay.stop()
     player.stop()
-    previewDelay.restart()
+    player.source = ""
+    slideSettle.restart()
   }
+  function selectedVideoUrl() {
+    return root.selected ? String(Util.fileUrl(root.selected.video)) : ""
+  }
+  function previewReady() {
+    return root.opened && !slideSettle.running && String(player.source) !== ""
+      && String(player.source) === selectedVideoUrl()
+      && player.playbackState === MediaPlayer.PlayingState
+  }
+  // Slightly longer than the 320 ms card animation, so the card is home before the video starts.
   Timer {
-    id: previewDelay
-    interval: 320
+    id: slideSettle
+    interval: 380
     onTriggered: {
       if (!root.opened || !root.selected) return
-      player.source = Util.fileUrl(root.selected.video)
+      player.source = root.selectedVideoUrl()
       player.play()
     }
   }
@@ -142,9 +155,9 @@ Item {
     loops: MediaPlayer.Infinite
     videoOutput: videoOut
     // No audioOutput: previews are always silent.
-    onPlaybackStateChanged: if (playbackState === MediaPlayer.PlayingState) fadeInDelay.restart()
+    onPlaybackStateChanged: if (root.previewReady()) fadeInDelay.restart()
   }
-  Timer { id: fadeInDelay; interval: 120; onTriggered: root.videoShown = true }
+  Timer { id: fadeInDelay; interval: 120; onTriggered: if (root.previewReady()) root.videoShown = true }
 
   PanelWindow {
     id: panel
