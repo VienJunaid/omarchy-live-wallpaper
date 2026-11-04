@@ -121,7 +121,7 @@ s = re.sub(r"\n?[ \t]*// " + re.escape(begin) + r".*?// " + re.escape(end) + r"[
 block = (
     f'\n  // {begin} (managed by install.sh - remove with uninstall.sh)\n'
     '  "style.live-wallpaper": {"icon": "\U000f0567", "label": "Live wallpaper", "description": "Preview the live wallpapers and pick one", "aliases": ["live-wallpaper", "wallpaper-video"], "action": "$HOME/.local/bin/live-wallpaper pick"},\n'
-    '  "style.live-wallpaper-bar": {"icon": "\U000f03d8", "label": "Bar matches wallpaper", "aliases": ["bar-style"], "action": "$HOME/.local/bin/live-wallpaper bar toggle", "checked": "[ \\"$($HOME/.local/bin/live-wallpaper bar)\\" = match ]"},\n'
+    '  "style.live-wallpaper-bar": {"icon": "\U000f03d8", "label": "Match bar", "description": "Bar colours follow the live wallpaper", "aliases": ["bar-style"], "action": "$HOME/.local/bin/live-wallpaper bar toggle", "checked": "[ \\"$($HOME/.local/bin/live-wallpaper bar)\\" = match ]"},\n'
     f'  // {end}'
 )
 i = s.index("{")

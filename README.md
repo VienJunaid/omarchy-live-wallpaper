@@ -25,7 +25,7 @@ The installer:
 
 1. installs `mpvpaper` (from the AUR) plus `python` and `ffmpeg` if they're missing,
 2. puts the `live-wallpaper` command in `~/.local/bin`,
-3. installs the picker into the Omarchy shell and adds **Style → Live wallpaper** to the menu,
+3. installs the picker into the Omarchy shell and adds **Style → Live wallpaper** and **Style → Match bar** to the menu,
 4. starts a small background loop at login (`~/.config/hypr/autostart.lua`) and starts it now,
 5. turns off Omarchy's static background, which would otherwise cover the video.
 
