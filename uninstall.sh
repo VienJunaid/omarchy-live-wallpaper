@@ -52,7 +52,8 @@ strip_block "$HOME/.config/hypr/autostart.lua"
 strip_block "$HOME/.config/hypr/autostart.conf"
 
 [[ -L $BIN ]] && rm -f "$BIN" && say "Removed $BIN"
-rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-live-wallpaper" "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-live-wallpaper"
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-live-wallpaper" "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-live-wallpaper" \
+  "${XDG_RUNTIME_DIR:-/tmp}/omarchy-live-wallpaper"
 [[ -d $INSTALL_DIR/.git ]] && rm -rf "$INSTALL_DIR" && say "Removed $INSTALL_DIR"
 
 if $PURGE; then
