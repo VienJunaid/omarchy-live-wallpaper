@@ -154,7 +154,7 @@ else
 fi
 
 # ---- 8. start it now
-pkill -f "live-wallpaper daemon" 2>/dev/null || true
+"$BIN" stop >/dev/null 2>&1 || true
 sleep 0.5
 setsid -f "$BIN" daemon >/dev/null 2>&1 < /dev/null
 sleep 3

@@ -13,6 +13,7 @@ Usage:
   live-wallpaper packs           installed packs
   live-wallpaper doctor          check dependencies and setup
   live-wallpaper daemon          background loop (started at login by the installer)
+  live-wallpaper stop [--all]    stop the background loop (--all: and the video wallpaper)
   live-wallpaper tick            one pass of the daemon loop
 
 A pack is a folder with a pack.json and a folder of .mp4 videos. Every video is a scene; dropping a
@@ -520,6 +521,34 @@ def tick(force=False):
     return scene, reason
 
 
+DAEMON_PID = RUNTIME_DIR / "daemon.pid"
+
+
+def daemon_pid():
+    """PID of the running daemon, verified against /proc so a stale file can't hit another process."""
+    try:
+        pid = int(DAEMON_PID.read_text())
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if any(a.endswith(b"live-wallpaper") for a in cmdline) and b"daemon" in cmdline:
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def cmd_stop(args):
+    """Stop the background loop (and, with --all, the video wallpaper too)."""
+    pid = daemon_pid()
+    if pid:
+        os.kill(pid, 15)
+        print("Stopped the background loop")
+    if "--all" in args:
+        if mpv_alive():
+            mpv_send(["quit"])
+            print("Stopped the video wallpaper")
+        MPV_SOCKET.unlink(missing_ok=True)
+
+
 def daemon():
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(RUNTIME_DIR / "daemon.lock", "w")
@@ -528,6 +557,7 @@ def daemon():
     except BlockingIOError:
         print("live-wallpaper daemon is already running")
         return
+    DAEMON_PID.write_text(str(os.getpid()))
     cfg = load_config()
     if cfg.get("restart_on_workspace_switch"):
         threading.Thread(target=watch_workspaces, daemon=True).start()
@@ -678,8 +708,7 @@ def cmd_doctor(args):
     _, source = prayer_times_today(cfg)
     print(f"· prayer times from: {source}")
     print(f"{'✓' if mpv_alive() else '·'} mpvpaper {'running' if mpv_alive() else 'not running'}")
-    r = run(["pgrep", "-f", "live-wallpaper daemon"])
-    print(f"{'✓' if r.returncode == 0 else '·'} daemon {'running' if r.returncode == 0 else 'not running'}")
+    print(f"{'✓' if daemon_pid() else '·'} daemon {'running (pid ' + str(daemon_pid()) + ')' if daemon_pid() else 'not running'}")
     sys.exit(0 if ok else 1)
 
 
@@ -693,7 +722,7 @@ def main(argv):
         "pick": cmd_pick, "open": cmd_pick, "list": cmd_list, "set": cmd_set, "auto": cmd_auto,
         "next": lambda a: cmd_step(1), "prev": lambda a: cmd_step(-1), "status": cmd_status,
         "bar": cmd_bar, "packs": cmd_packs, "doctor": cmd_doctor,
-        "daemon": lambda a: daemon(), "tick": lambda a: tick(),
+        "daemon": lambda a: daemon(), "tick": lambda a: tick(), "stop": cmd_stop,
     }
     if cmd in ("-h", "--help", "help"):
         print(__doc__.strip())
