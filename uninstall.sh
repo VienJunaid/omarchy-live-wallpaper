@@ -32,7 +32,7 @@ PY
 }
 
 # Bar colours back to the theme's (and any values of yours we had replaced).
-[[ -x $BIN ]] && "$BIN" bar off >/dev/null 2>&1 && say "Restored the bar colours"
+[[ -x $BIN ]] && "$BIN" bar clear >/dev/null 2>&1 && say "Restored the bar colours"
 
 [[ -x $BIN ]] && "$BIN" stop --all
 pkill -x mpvpaper 2>/dev/null && say "Stopped mpvpaper"

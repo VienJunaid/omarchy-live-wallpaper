@@ -321,9 +321,11 @@ def play(video):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     MPV_SOCKET.unlink(missing_ok=True)
     # No --auto-pause: its resume detection is unreliable and leaves the wallpaper frozen.
-    subprocess.Popen(["mpvpaper", "-o", f"no-audio loop panscan=1.0 keep-open=yes input-ipc-server={MPV_SOCKET}",
-                      "*", video], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    # `setsid -f` double-forks, so mpvpaper is never our child: if it dies it can't linger as a
+    # zombie under the daemon (which would also look "running" to pgrep).
+    subprocess.run(["setsid", "-f", "mpvpaper", "-o",
+                    f"no-audio loop panscan=1.0 keep-open=yes input-ipc-server={MPV_SOCKET}", "*", video],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(30):
         if mpv_alive():
             break
@@ -682,6 +684,8 @@ def cmd_bar(args):
         cur = find_scene(load_state().get("current") or "") if load_state().get("current") else None
         sync_bar(cfg, cur)
         print(f"Bar colours: {mode}")
+    elif mode == "clear":  # remove our colours without changing the setting (used by uninstall)
+        write_bar(None)
     elif mode == "status":
         print(cfg.get("bar"))
     else:
