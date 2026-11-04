@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.vienjunaid.live-wallpaper",
+  "name": "Live wallpaper picker",
+  "version": "1.0.0",
+  "author": "omarchy-live-wallpaper",
+  "description": "Carousel picker for omarchy-live-wallpaper: preview the scenes playing, then Save",
+  "kinds": ["overlay"],
+  "entryPoints": { "overlay": "LiveWallpaperPicker.qml" }
+}

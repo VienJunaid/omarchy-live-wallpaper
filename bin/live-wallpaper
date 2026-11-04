@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""live-wallpaper: animated video wallpapers for Omarchy, organised into packs.
+
+Usage:
+  live-wallpaper                 open the visual picker (same as `pick`)
+  live-wallpaper pick            open / close the visual picker
+  live-wallpaper list [--json]   every scene from every installed pack
+  live-wallpaper set <scene>     play a scene and keep it ("pack/scene" or a unique scene name)
+  live-wallpaper auto            follow the schedule again (e.g. prayer times)
+  live-wallpaper next | prev     step to the next / previous scene and keep it
+  live-wallpaper status          what's playing, why, and the schedule for today
+  live-wallpaper bar match|off|toggle   colour the Omarchy bar to match the wallpaper
+  live-wallpaper packs           installed packs
+  live-wallpaper doctor          check dependencies and setup
+  live-wallpaper daemon          background loop (started at login by the installer)
+  live-wallpaper tick            one pass of the daemon loop
+
+A pack is a folder with a pack.json and a folder of .mp4 videos. Every video is a scene; dropping a
+new video into a pack is all it takes to add one. See docs/creating-a-pack.md.
+"""
+
+import colorsys
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+APP = "omarchy-live-wallpaper"
+HOME = Path.home()
+REPO = Path(os.path.realpath(__file__)).parent.parent
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / APP
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / APP
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / APP
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/{APP}-{os.getuid()}")) / APP
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_FILE = STATE_DIR / "state.json"
+MPV_SOCKET = RUNTIME_DIR / "mpv.sock"
+SHELL_TOML = HOME / ".config/omarchy/shell.toml"
+PLUGIN_ID = "io.github.vienjunaid.live-wallpaper"
+
+PRAYERS = ["fajr", "dhuhr", "asr", "maghrib", "isha"]
+# Used only when no prayer-time source is reachable.
+FALLBACK_PRAYER_TIMES = {"fajr": "05:30", "dhuhr": "12:30", "asr": "15:30", "maghrib": "18:00", "isha": "19:30"}
+
+DEFAULT_CONFIG = {
+    "follow": "sacred-places",          # pack whose schedule "auto" follows
+    "prayer_source": "auto",            # auto | omarchy-prayer | aladhan | fixed
+    "location": {"city": "", "country": "", "method": 2},  # for aladhan (method 2 = ISNA)
+    "bar": "match",                     # match | off
+    "glow": True,                       # recolour the window shadow per scene (if the scene sets one)
+    "restart_on_workspace_switch": False,
+    "tick_seconds": 30,
+}
+
+
+# ---------------------------------------------------------------- small helpers
+
+def die(msg, code=1):
+    print(f"live-wallpaper: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as e:
+        die(f"{path} is not valid JSON: {e}")
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(read_json(CONFIG_FILE, {}))
+    return cfg
+
+
+def load_state():
+    return read_json(STATE_FILE, {"pinned": None, "current": None})
+
+
+def save_state(state):
+    write_json(STATE_FILE, state)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+# ---------------------------------------------------------------- packs & scenes
+
+def pack_dirs():
+    """Packs shipped with the repo, then the user's own (which win on a name clash)."""
+    found = {}
+    for root in (REPO / "packs", CONFIG_DIR / "packs"):
+        if root.is_dir():
+            for d in sorted(root.iterdir()):
+                if (d / "pack.json").is_file():
+                    found[d.name] = d
+    return found
+
+
+def load_pack(pack_id, pack_dir):
+    meta = read_json(pack_dir / "pack.json", {})
+    videos_dir = Path(os.path.expanduser(meta.get("videos_dir", "videos")))
+    if not videos_dir.is_absolute():
+        videos_dir = pack_dir / videos_dir
+    exclude = set(meta.get("exclude", []))
+    scene_meta = meta.get("scenes", {})
+    scenes = []
+    if videos_dir.is_dir():
+        for f in sorted(videos_dir.iterdir()):
+            if f.suffix.lower() not in (".mp4", ".webm", ".mkv", ".mov") or f.stem in exclude:
+                continue
+            m = scene_meta.get(f.stem, {})
+            scenes.append({
+                "id": f"{pack_id}/{f.stem}",
+                "name": f.stem,
+                "pack": pack_id,
+                "packLabel": meta.get("name", pack_id),
+                "label": m.get("label", f.stem.replace("-", " ").replace("_", " ").title()),
+                "subtitle": m.get("subtitle", ""),
+                "order": m.get("order", 500),
+                "glow": m.get("glow"),
+                "bar": m.get("bar"),
+                "video": str(f),
+                "poster": str(CACHE_DIR / "posters" / f"{pack_id}__{f.stem}.jpg"),
+            })
+    scenes.sort(key=lambda s: (s["order"], s["label"]))
+    return {"id": pack_id, "name": meta.get("name", pack_id), "description": meta.get("description", ""),
+            "schedule": meta.get("schedule"), "scenes": scenes, "dir": str(pack_dir)}
+
+
+def all_packs():
+    cfg = load_config()
+    packs = [load_pack(pid, d) for pid, d in pack_dirs().items()]
+    # The followed pack first, then the rest alphabetically.
+    packs.sort(key=lambda p: (p["id"] != cfg["follow"], p["name"].lower()))
+    return packs
+
+
+def all_scenes():
+    return [s for p in all_packs() for s in p["scenes"]]
+
+
+def find_scene(ref, scenes=None):
+    scenes = scenes if scenes is not None else all_scenes()
+    exact = [s for s in scenes if s["id"] == ref]
+    if exact:
+        return exact[0]
+    by_name = [s for s in scenes if s["name"] == ref]
+    if len(by_name) == 1:
+        return by_name[0]
+    if len(by_name) > 1:
+        die(f'"{ref}" is in several packs; use one of: ' + ", ".join(s["id"] for s in by_name))
+    return None
+
+
+def mtime(p):
+    try:
+        return os.stat(p).st_mtime
+    except OSError:
+        return 0
+
+
+def ensure_posters(scenes):
+    """One still frame per video, cached; regenerated when the video changes."""
+    (CACHE_DIR / "posters").mkdir(parents=True, exist_ok=True)
+    jobs = []
+    for s in scenes:
+        if mtime(s["poster"]) >= mtime(s["video"]):
+            continue
+        jobs.append(subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error", "-y", "-ss", "5", "-i", s["video"], "-frames:v", "1",
+             "-vf", "scale=960:-2", "-q:v", "3", s["poster"]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    for j in jobs:
+        j.wait()
+    for s in scenes:  # clips shorter than 5 s: use the first frame
+        if not mtime(s["poster"]):
+            subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", s["video"], "-frames:v", "1",
+                            "-vf", "scale=960:-2", s["poster"]], capture_output=True)
+
+
+# ---------------------------------------------------------------- schedule
+
+def prayer_times_today(cfg):
+    """{prayer: datetime} for today, from the best available source."""
+    today = dt.date.today()
+    source = cfg.get("prayer_source", "auto")
+
+    if source in ("auto", "omarchy-prayer") and have("omarchy-prayer"):
+        r = run(["omarchy-prayer", "status", "--json"], timeout=10)
+        if r.returncode == 0:
+            try:
+                data = json.loads(r.stdout)
+                times = {p["name"]: dt.datetime.fromtimestamp(p["epoch"]) for p in data.get("prayers", [])
+                         if p.get("name") in PRAYERS}
+                if len(times) == 5:
+                    return times, "omarchy-prayer"
+            except (ValueError, KeyError, TypeError):
+                pass
+
+    loc = cfg.get("location", {})
+    if source in ("auto", "aladhan") and loc.get("city") and loc.get("country"):
+        cache = CACHE_DIR / f"prayer-{today.isoformat()}.json"
+        data = read_json(cache, None)
+        if data is None:
+            q = urllib.parse.urlencode({"city": loc["city"], "country": loc["country"], "method": loc.get("method", 2)})
+            url = f"https://api.aladhan.com/v1/timingsByCity/{today.strftime('%d-%m-%Y')}?{q}"
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    data = json.load(resp)["data"]["timings"]
+                write_json(cache, data)
+            except Exception:
+                data = None
+        if data:
+            times = {}
+            for p in PRAYERS:
+                hh, mm = re.match(r"(\d+):(\d+)", data[p.capitalize()]).groups()
+                times[p] = dt.datetime.combine(today, dt.time(int(hh), int(mm)))
+            return times, "aladhan"
+
+    return ({p: dt.datetime.combine(today, dt.time.fromisoformat(t)) for p, t in FALLBACK_PRAYER_TIMES.items()},
+            "fixed fallback times")
+
+
+def current_prayer(times, now):
+    """Fajr runs until Dhuhr, Isha until the next Fajr."""
+    current = "isha"
+    for p in PRAYERS:
+        if now >= times[p]:
+            current = p
+    return current
+
+
+def scheduled_scene(cfg, packs):
+    """(scene, reason) that the schedule wants right now."""
+    pack = next((p for p in packs if p["id"] == cfg["follow"]), None) or (packs[0] if packs else None)
+    if not pack or not pack["scenes"]:
+        return None, "no scenes installed"
+    sched = pack.get("schedule") or {}
+    now = dt.datetime.now()
+    want = None
+    if sched.get("type") == "prayer":
+        times, source = prayer_times_today(cfg)
+        period = current_prayer(times, now)
+        want, reason = sched.get("map", {}).get(period), f"{period.capitalize()} ({source})"
+    elif sched.get("type") == "time":
+        slots = sorted(sched.get("slots", []), key=lambda s: s[0])
+        reason = "time of day"
+        for at, scene in slots:
+            if now.time() >= dt.time.fromisoformat(at):
+                want = scene
+        if want is None and slots:
+            want = slots[-1][1]
+    else:
+        reason = "first scene (pack has no schedule)"
+    scene = find_scene(f"{pack['id']}/{want}", pack["scenes"]) if want else None
+    return (scene or pack["scenes"][0]), reason
+
+
+def schedule_label(cfg, packs):
+    pack = next((p for p in packs if p["id"] == cfg["follow"]), None)
+    t = ((pack or {}).get("schedule") or {}).get("type")
+    return {"prayer": "Follow prayer times", "time": "Follow time of day"}.get(t, "Follow schedule")
+
+
+# ---------------------------------------------------------------- mpvpaper
+
+def mpv_send(*commands):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(str(MPV_SOCKET))
+        for c in commands:
+            s.sendall((json.dumps({"command": list(c)}) + "\n").encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def mpv_alive():
+    return MPV_SOCKET.exists() and mpv_send(["get_property", "pid"])
+
+
+def play(video):
+    """Show `video` as the wallpaper: hot-swap if our mpvpaper is up, else (re)start it."""
+    # Omarchy's own background (swaybg on older versions) claims the same layer.
+    run(["pkill", "-x", "swaybg"])
+    if mpv_alive():
+        mpv_send(["loadfile", video, "replace"], ["set_property", "pause", False])
+        return
+    # An mpvpaper we don't control (another setup, or a stale one): replace it.
+    run(["pkill", "-x", "mpvpaper"])
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    MPV_SOCKET.unlink(missing_ok=True)
+    # No --auto-pause: its resume detection is unreliable and leaves the wallpaper frozen.
+    subprocess.Popen(["mpvpaper", "-o", f"no-audio loop panscan=1.0 keep-open=yes input-ipc-server={MPV_SOCKET}",
+                      "*", video], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(30):
+        if mpv_alive():
+            break
+        time.sleep(0.1)
+
+
+# ---------------------------------------------------------------- window glow
+
+def apply_glow(color):
+    if not color or not have("hyprctl"):
+        return
+    color = color.lstrip("#").lower()
+    r = run(["hyprctl", "getoption", "decoration:shadow:color", "-j"])
+    if r.returncode == 0 and color in r.stdout.lower():
+        return
+    lua = ('hl.config({ decoration = { shadow = { color = "#%s", color_inactive = "rgba(%s77)" } } })'
+           % (color, color))
+    if run(["hyprctl", "eval", lua]).stdout.strip() != "ok":  # older, non-Lua Hyprland
+        run(["hyprctl", "keyword", "decoration:shadow:color", f"rgb({color})"])
+        run(["hyprctl", "keyword", "decoration:shadow:color_inactive", f"rgba({color}77)"])
+
+
+# ---------------------------------------------------------------- bar colours
+
+MANAGED_KEYS = {
+    "bar": ["background", "background-alpha", "text", "active"],
+    "popups": ["background", "background-alpha", "text", "border", "border-alpha"],
+    "tooltip": ["background", "background-alpha", "text", "border"],
+    "menu": ["selected-text", "selected-border"],
+    "launcher": ["selected-text", "selected-border"],
+}
+BAR_MARK = f"# managed by {APP}"
+
+
+def sample_palette(poster):
+    """Palette from a poster: darkest prominent colour for the bar, lightest for text,
+    the most saturated ones for accents. Uses ffmpeg only (no ImageMagick needed)."""
+    r = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", poster, "-vf", "scale=64:36", "-f", "rawvideo",
+                        "-pix_fmt", "rgb24", "-"], capture_output=True)
+    px = r.stdout
+    if len(px) < 3:
+        return None
+    buckets = {}
+    for i in range(0, len(px) - 2, 3):
+        key = (px[i] >> 4, px[i + 1] >> 4, px[i + 2] >> 4)
+        b = buckets.setdefault(key, [0, 0, 0, 0])
+        b[0] += px[i]; b[1] += px[i + 1]; b[2] += px[i + 2]; b[3] += 1
+    cols = sorted(((n, (r_ / n / 255, g / n / 255, b_ / n / 255)) for r_, g, b_, n in buckets.values()),
+                  reverse=True)[:10]
+    rgbs = [c for _, c in cols]
+    lum = lambda c: 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    sat = lambda c: colorsys.rgb_to_hls(*c)[2]
+    hexc = lambda c: "%02x%02x%02x" % tuple(int(max(0, min(1, x)) * 255) for x in c)
+
+    def lift(c, floor):
+        for _ in range(25):
+            if lum(c) >= floor:
+                break
+            c = tuple(x + (1 - x) * 0.15 for x in c)
+        return c
+
+    dark = min(rgbs, key=lum)
+    bg = tuple(x * 0.6 for x in dark) if lum(dark) > 0.18 else dark
+    text = max(rgbs, key=lum)
+    if lum(text) - lum(bg) < 0.45:
+        text = lift(text, lum(bg) + 0.6)
+    vivid = sorted((c for c in rgbs if c != dark), key=sat, reverse=True) or [text]
+    active = lift(vivid[0], 0.35)
+    second = lift(vivid[1] if len(vivid) > 1 else vivid[0], 0.25)
+    return {"background": hexc(bg), "alpha": 0.85, "text": hexc(text), "active": hexc(active),
+            "border": [hexc(second), hexc(active)]}
+
+
+def scene_palette(scene):
+    if scene.get("bar"):
+        return scene["bar"]
+    ensure_posters([scene])
+    return sample_palette(scene["poster"])
+
+
+BAR_ORIGINALS = CONFIG_DIR / "bar-originals.json"
+
+
+def write_bar(palette):
+    """Merge our keys into ~/.config/omarchy/shell.toml, leaving everything else alone.
+    Values of the user's own that we override are remembered and put back when matching is off."""
+    lines = SHELL_TOML.read_text().splitlines() if SHELL_TOML.exists() else []
+    originals = read_json(BAR_ORIGINALS, {})
+    sections, order, cur, ours_block = {"": []}, [""], "", False
+    for line in lines:
+        m = re.match(r"^\[([A-Za-z0-9_-]+)\]\s*$", line)
+        if m:
+            cur, ours_block = m.group(1), False
+            if cur not in sections:
+                sections[cur] = []
+                order.append(cur)
+            continue
+        if line.strip() == BAR_MARK:
+            ours_block = True
+            continue
+        if not line.strip():
+            ours_block = False
+        key = re.match(r"^\s*([A-Za-z0-9_-]+)\s*=", line)
+        if key and key.group(1) in MANAGED_KEYS.get(cur, []):
+            if not ours_block:  # the user's own value: remember it before we take the key over
+                originals.setdefault(f"{cur}.{key.group(1)}", line)
+            continue
+        sections[cur].append(line)
+
+    if not palette:  # matching off: give the user's own values back
+        for full, line in originals.items():
+            sec = full.split(".", 1)[0]
+            if sec not in sections:
+                sections[sec] = []
+                order.append(sec)
+            sections[sec].append(line)
+        BAR_ORIGINALS.unlink(missing_ok=True)
+    elif originals:
+        write_json(BAR_ORIGINALS, originals)
+
+    if palette:
+        p = palette
+        border = p.get("border") or [p["active"], p["active"]]
+        q = lambda h: '"#%s"' % h.lstrip("#")
+        ours = {
+            "bar": [("background", q(p["background"])), ("background-alpha", p.get("alpha", 0.85)),
+                    ("text", q(p["text"])), ("active", q(p["active"]))],
+            "popups": [("background", q(p["background"])), ("background-alpha", 0.95), ("text", q(p["text"])),
+                       ("border", '"rgba(%sff) rgba(%sff) 45deg"' % (border[0].lstrip("#"), border[1].lstrip("#"))),
+                       ("border-alpha", 1.0)],
+            "tooltip": [("background", q(p["background"])), ("background-alpha", 0.95), ("text", q(p["text"])),
+                        ("border", q(border[0]))],
+            "menu": [("selected-text", q(p["active"])), ("selected-border", q(border[0]))],
+            "launcher": [("selected-text", q(p["active"])), ("selected-border", q(border[0]))],
+        }
+        for sec, kvs in ours.items():
+            if sec not in sections:
+                sections[sec] = []
+                order.append(sec)
+            body = [l for l in sections[sec]]
+            while body and not body[-1].strip():
+                body.pop()
+            sections[sec] = body + [BAR_MARK] + [f"{k} = {v}" for k, v in kvs] + [""]
+
+    out = []
+    for sec in order:
+        body = sections[sec]
+        if sec and not any(l.strip() and not l.strip().startswith("#") for l in body):
+            continue  # section now empty
+        if sec:
+            if out and out[-1].strip():
+                out.append("")
+            out.append(f"[{sec}]")
+        out.extend(body)
+    text = "\n".join(out).strip() + "\n"
+    if not SHELL_TOML.exists() or SHELL_TOML.read_text() != text:
+        SHELL_TOML.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SHELL_TOML.with_suffix(".toml.tmp")
+        tmp.write_text(text)
+        tmp.replace(SHELL_TOML)  # the shell hot-reloads this file
+
+
+def sync_bar(cfg, scene):
+    if cfg.get("bar") == "match" and scene:
+        write_bar(scene_palette(scene))
+    elif cfg.get("bar") == "off":
+        write_bar(None)
+
+
+# ---------------------------------------------------------------- reconcile
+
+def desired_scene(cfg, state, packs):
+    scenes = [s for p in packs for s in p["scenes"]]
+    if state.get("pinned"):
+        s = find_scene(state["pinned"], scenes)
+        if s:
+            return s, "pinned"
+    return scheduled_scene(cfg, packs)
+
+
+def tick(force=False):
+    cfg, state, packs = load_config(), load_state(), all_packs()
+    scene, reason = desired_scene(cfg, state, packs)
+    if not scene:
+        return None, reason
+    changed = state.get("current") != scene["id"]
+    if force or changed or not mpv_alive():
+        play(scene["video"])
+        state["current"] = scene["id"]
+        save_state(state)
+    if cfg.get("glow", True):
+        apply_glow(scene.get("glow"))
+    if force or changed:
+        sync_bar(cfg, scene)
+    return scene, reason
+
+
+def daemon():
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(RUNTIME_DIR / "daemon.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("live-wallpaper daemon is already running")
+        return
+    cfg = load_config()
+    if cfg.get("restart_on_workspace_switch"):
+        threading.Thread(target=watch_workspaces, daemon=True).start()
+    tick(force=True)
+    while True:
+        time.sleep(max(5, int(load_config().get("tick_seconds", 30))))
+        try:
+            tick()
+        except Exception as e:  # keep the wallpaper alive whatever happens
+            print(f"tick failed: {e}", file=sys.stderr)
+
+
+def watch_workspaces():
+    """Restart the video from the top on every workspace switch (optional)."""
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return
+    path = Path(os.environ.get("XDG_RUNTIME_DIR", "")) / "hypr" / sig / ".socket2.sock"
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(str(path))
+                buf = b""
+                while True:
+                    data = s.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if line.startswith(b"workspace>>"):
+                            mpv_send(["seek", 0, "absolute"])
+        except OSError:
+            pass
+        time.sleep(2)
+
+
+def nudge_daemon_or_tick():
+    """Apply a change now (the daemon would also pick it up on its next tick)."""
+    scene, _ = tick(force=True)
+    return scene
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(args):
+    cfg, state, packs = load_config(), load_state(), all_packs()
+    scenes = [s for p in packs for s in p["scenes"]]
+    if "--json" in args:
+        ensure_posters(scenes)
+        print(json.dumps({
+            "current": state.get("current") or "",
+            "pinned": state.get("pinned") or "",
+            "mode": "pinned" if state.get("pinned") else "auto",
+            "scheduleLabel": schedule_label(cfg, packs),
+            "scenes": scenes,
+        }))
+        return
+    for p in packs:
+        print(f"{p['name']}  ({p['id']}){'  ← followed' if p['id'] == cfg['follow'] else ''}")
+        for s in p["scenes"]:
+            mark = "▶" if s["id"] == state.get("current") else " "
+            print(f"  {mark} {s['id']:<34} {s['label']}")
+
+
+def cmd_set(args):
+    if not args:
+        die("usage: live-wallpaper set <scene>", 2)
+    scene = find_scene(args[0])
+    if not scene:
+        die(f'unknown scene "{args[0]}" (see: live-wallpaper list)')
+    state = load_state()
+    state["pinned"] = scene["id"]
+    save_state(state)
+    nudge_daemon_or_tick()
+    print(f"Now playing {scene['label']} ({scene['id']})")
+
+
+def cmd_auto(args):
+    state = load_state()
+    state["pinned"] = None
+    save_state(state)
+    scene = nudge_daemon_or_tick()
+    print(f"Following the schedule: {scene['label'] if scene else 'nothing to play'}")
+
+
+def cmd_step(direction):
+    scenes = all_scenes()
+    if not scenes:
+        die("no scenes installed")
+    cur = load_state().get("current")
+    ids = [s["id"] for s in scenes]
+    i = (ids.index(cur) + direction) % len(ids) if cur in ids else 0
+    cmd_set([ids[i]])
+    if have("notify-send"):
+        run(["notify-send", "-a", "Live wallpaper", scenes[i]["label"], scenes[i]["subtitle"] or scenes[i]["packLabel"]])
+
+
+def cmd_status(args):
+    cfg, state, packs = load_config(), load_state(), all_packs()
+    scene, reason = desired_scene(cfg, state, packs)
+    print(f"Playing:   {scene['label'] + ' (' + scene['id'] + ')' if scene else 'nothing'}")
+    print(f"Because:   {reason}")
+    print(f"Follows:   {cfg['follow']}  ·  bar: {cfg.get('bar')}  ·  mpvpaper: {'running' if mpv_alive() else 'not running'}")
+    pack = next((p for p in packs if p["id"] == cfg["follow"]), None)
+    if pack and (pack.get("schedule") or {}).get("type") == "prayer":
+        times, source = prayer_times_today(cfg)
+        m = pack["schedule"].get("map", {})
+        print(f"Today ({source}):")
+        for p in PRAYERS:
+            print(f"  {p.capitalize():<8} {times[p].strftime('%H:%M')}  → {m.get(p, '-')}")
+
+
+def cmd_bar(args):
+    cfg = load_config()
+    mode = args[0] if args else "status"
+    if mode == "toggle":
+        mode = "off" if cfg.get("bar") == "match" else "match"
+    if mode in ("match", "off"):
+        cfg["bar"] = mode
+        write_json(CONFIG_FILE, {**read_json(CONFIG_FILE, {}), "bar": mode})
+        cur = find_scene(load_state().get("current") or "") if load_state().get("current") else None
+        sync_bar(cfg, cur)
+        print(f"Bar colours: {mode}")
+    elif mode == "status":
+        print(cfg.get("bar"))
+    else:
+        die("usage: live-wallpaper bar match|off|toggle", 2)
+
+
+def cmd_packs(args):
+    cfg = load_config()
+    for p in all_packs():
+        sched = (p.get("schedule") or {}).get("type", "none")
+        print(f"{p['id']:<20} {len(p['scenes']):>2} scenes  schedule: {sched:<7} {p['dir']}"
+              f"{'  ← followed' if p['id'] == cfg['follow'] else ''}")
+
+
+def cmd_doctor(args):
+    ok = True
+    for c in ("mpvpaper", "ffmpeg", "hyprctl", "omarchy-shell"):
+        found = have(c)
+        ok &= found
+        print(f"{'✓' if found else '✗'} {c}")
+    packs = all_packs()
+    print(f"{'✓' if packs else '✗'} packs: {', '.join(p['id'] + ' (' + str(len(p['scenes'])) + ')' for p in packs) or 'none'}")
+    cfg = load_config()
+    _, source = prayer_times_today(cfg)
+    print(f"· prayer times from: {source}")
+    print(f"{'✓' if mpv_alive() else '·'} mpvpaper {'running' if mpv_alive() else 'not running'}")
+    r = run(["pgrep", "-f", "live-wallpaper daemon"])
+    print(f"{'✓' if r.returncode == 0 else '·'} daemon {'running' if r.returncode == 0 else 'not running'}")
+    sys.exit(0 if ok else 1)
+
+
+def cmd_pick(args):
+    os.execvp("omarchy-shell", ["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"])
+
+
+def main(argv):
+    cmd, args = (argv[0] if argv else "pick"), argv[1:]
+    commands = {
+        "pick": cmd_pick, "open": cmd_pick, "list": cmd_list, "set": cmd_set, "auto": cmd_auto,
+        "next": lambda a: cmd_step(1), "prev": lambda a: cmd_step(-1), "status": cmd_status,
+        "bar": cmd_bar, "packs": cmd_packs, "doctor": cmd_doctor,
+        "daemon": lambda a: daemon(), "tick": lambda a: tick(),
+    }
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    if cmd not in commands:
+        die(f"unknown command: {cmd} (try --help)", 2)
+    commands[cmd](args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

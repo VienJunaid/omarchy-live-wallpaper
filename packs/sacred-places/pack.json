@@ -1,0 +1,37 @@
+{
+  "name": "Sacred Places",
+  "description": "Pixel-art scenes of Masjid al-Haram, Masjid an-Nabawi and a mosque at night. Follows the five daily prayer times.",
+  "schedule": {
+    "type": "prayer",
+    "map": {
+      "fajr": "madinah",
+      "dhuhr": "madinah",
+      "asr": "madinah",
+      "maghrib": "haram-aerial",
+      "isha": "night-mosque"
+    }
+  },
+  "scenes": {
+    "madinah": {
+      "label": "Madinah",
+      "subtitle": "Masjid an-Nabawi by day",
+      "order": 1,
+      "glow": "5e98e1",
+      "bar": { "background": "1d3f7a", "alpha": 0.85, "text": "e1dfda", "active": "629ead", "border": ["5e98e1", "e1dfda"] }
+    },
+    "haram-aerial": {
+      "label": "Kaaba Aerial",
+      "subtitle": "Masjid al-Haram from above",
+      "order": 2,
+      "glow": "f2cf72",
+      "bar": { "background": "282636", "alpha": 0.85, "text": "ddd9cd", "active": "f2cf72", "border": ["948368", "f2cf72"] }
+    },
+    "night-mosque": {
+      "label": "Night Mosque",
+      "subtitle": "Crescent moon and lanterns",
+      "order": 3,
+      "glow": "7aa2f7",
+      "bar": { "background": "1c1c28", "alpha": 0.6, "text": "c8cce0", "active": "7aa2f7", "border": ["3a4460", "7aa2f7"] }
+    }
+  }
+}
