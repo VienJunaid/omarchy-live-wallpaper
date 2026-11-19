@@ -1,33 +1,41 @@
-# omarchy-live-wallpaper
+# omarchy-live-wallpaper (legacy-omarchy3 branch)
 
-Animated video wallpapers for [Omarchy](https://omarchy.org), with a visual picker and a bar that
+> **This branch is a port for pre-Omarchy-4 (waybar + walker) setups.** No visual picker, and
+> bar matching only covers the bar itself. See [docs/legacy-port.md](docs/legacy-port.md) for
+> what differs from the main branch, and for the upgrade path once you're on Omarchy 4.
+
+Animated video wallpapers for [Omarchy](https://omarchy.org), with a text picker and a bar that
 matches the scene.
 
-- **Visual picker.** SUPER+SPACE → Style → Live wallpaper opens a carousel. The big card in the
-  middle plays the real video, smaller cards show the other scenes, and nothing changes until you
-  press **Save**.
+- **Picker.** SUPER+SPACE → Style → Live wallpaper opens a `walker` list of every scene plus
+  Auto; pick one and it plays immediately (no preview, no Save step -- see
+  [docs/legacy-port.md](docs/legacy-port.md)).
 - **Follows a schedule.** The included pack changes scene with the five daily prayer times. Packs can
   also follow the time of day, or you can pin one scene.
-- **Bar matches the wallpaper.** The Omarchy bar, popups and menu highlight take their colours from
-  the scene that's playing. Turn it off any time; your own colours come back.
+- **Bar matches the wallpaper.** The waybar background/foreground take their colours from the
+  scene that's playing. Turn it off any time; your theme's colours come back.
 - **Packs.** Wallpapers come in packs: a folder of videos plus a small `pack.json`. Drop a video in
   and it appears in the picker. See [docs/creating-a-pack.md](docs/creating-a-pack.md).
 
 ## Install
 
-Needs **Omarchy 4** or newer.
+Needs Hyprland + waybar + walker (pre-Omarchy-4; see [docs/legacy-port.md](docs/legacy-port.md)).
+`omarchy-prayer-wallpaper-swap.timer`, if you have one, should be disabled first -- it fights
+over the same mpvpaper/glow.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/VienJunaid/omarchy-live-wallpaper/main/install.sh | bash
+git clone -b legacy-omarchy3 https://github.com/VienJunaid/omarchy-live-wallpaper.git
+cd omarchy-live-wallpaper
+./install.sh
 ```
 
 The installer:
 
 1. installs `mpvpaper` (from the AUR) plus `python` and `ffmpeg` if they're missing,
 2. puts the `live-wallpaper` command in `~/.local/bin`,
-3. installs the picker into the Omarchy shell and adds **Style → Live wallpaper** and **Style → Match bar** to the menu,
-4. starts a small background loop at login (`~/.config/hypr/autostart.lua`) and starts it now,
-5. turns off Omarchy's static background, which would otherwise cover the video.
+3. hooks bar matching into `~/.config/waybar/style.css` and adds **Style → Live wallpaper** and
+   **Style → Match bar** to the menu (`~/.config/omarchy/extensions/menu.sh`),
+4. starts a small background loop at login (`~/.config/hypr/autostart.conf`) and starts it now.
 
 It asks for your city (for prayer times) unless `omarchy-prayer` is installed. Every file it edits
 is backed up first (`*.bak.<timestamp>`), and its changes are marked so they can be removed cleanly.
@@ -46,10 +54,10 @@ Re-running it updates the install.
 | `live-wallpaper list` / `packs` | scenes and packs |
 | `live-wallpaper doctor` | check the setup |
 
-Want a key for "next scene"? Add to `~/.config/hypr/bindings.lua`:
+Want a key for "next scene"? Add to `~/.config/hypr/bindings.conf`:
 
-```lua
-o.bind("SUPER + U", "Next live wallpaper", "live-wallpaper next")
+```
+bind = SUPER, U, exec, live-wallpaper next
 ```
 
 ## Included pack: Sacred Places
@@ -86,7 +94,7 @@ otherwise from fixed approximate times.
 
 ```
 bin/live-wallpaper      the whole tool: packs, schedule, mpvpaper control, bar colours (Python, stdlib only)
-plugin/                 the carousel picker: an omarchy-shell overlay plugin (QML), calls `live-wallpaper list --json`
+plugin/                 unused on this branch (it's the Omarchy-4 QML overlay; see docs/legacy-port.md)
 packs/<id>/             pack.json + videos/*.mp4
 install.sh              one-command install; uninstall.sh reverses it
 ```
@@ -95,9 +103,9 @@ install.sh              one-command install; uninstall.sh reverses it
   socket, so there's no flash.
 - `live-wallpaper daemon` (started at login) checks the schedule every 30 seconds and restarts
   `mpvpaper` if it ever dies.
-- Bar colours are written to `~/.config/omarchy/shell.toml`, which the shell hot-reloads. Only the
-  keys it manages are touched, and any of your own values it replaces are put back when matching is
-  turned off.
+- Bar colours are written to `~/.config/omarchy-live-wallpaper/waybar-match.css`, `@import`ed by
+  `~/.config/waybar/style.css`; `live-wallpaper` restarts waybar after writing it so the change
+  shows immediately. Only background/foreground are touched.
 
 ## Uninstall
 
@@ -106,8 +114,7 @@ install.sh              one-command install; uninstall.sh reverses it
 ~/.local/share/omarchy-live-wallpaper/uninstall.sh --purge    # removes them too
 ```
 
-This removes the menu entries, picker, autostart line, command and bar colours, and turns
-Omarchy's normal background back on.
+This removes the menu entry, autostart line, command and bar colours.
 
 ## License
 

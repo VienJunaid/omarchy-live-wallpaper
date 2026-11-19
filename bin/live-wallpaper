@@ -46,8 +46,9 @@ RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/{APP}-{os.getuid()}"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = STATE_DIR / "state.json"
 MPV_SOCKET = RUNTIME_DIR / "mpv.sock"
-SHELL_TOML = HOME / ".config/omarchy/shell.toml"
-PLUGIN_ID = "io.github.vienjunaid.live-wallpaper"
+# Legacy port (pre-Omarchy-4: waybar + walker, no omarchy-shell/Quickshell).
+# See docs/legacy-port.md for what differs from the upstream repo.
+WAYBAR_CSS = CONFIG_DIR / "waybar-match.css"
 
 PRAYERS = ["fajr", "dhuhr", "asr", "maghrib", "isha"]
 # Used only when no prayer-time source is reachable.
@@ -349,16 +350,12 @@ def apply_glow(color):
 
 
 # ---------------------------------------------------------------- bar colours
-
-MANAGED_KEYS = {
-    "bar": ["background", "background-alpha", "text", "active"],
-    "popups": ["background", "background-alpha", "text", "border", "border-alpha"],
-    "tooltip": ["background", "background-alpha", "text", "border"],
-    "menu": ["selected-text", "selected-border"],
-    "launcher": ["selected-text", "selected-border"],
-}
-BAR_MARK = f"# managed by {APP}"
-
+#
+# Omarchy 4's shell.toml doesn't exist here. Instead we write background/foreground
+# overrides to a small CSS file that install.sh @imports into ~/.config/waybar/style.css
+# (after the theme's own waybar.css, so these win), then restart waybar to pick it up.
+# This only reaches the bar itself -- there's no equivalent hook for popups/menu/launcher
+# highlight colours in the old shell, so those stay whatever the theme set.
 
 def sample_palette(poster):
     """Palette from a poster: darkest prominent colour for the bar, lightest for text,
@@ -406,86 +403,31 @@ def scene_palette(scene):
     return sample_palette(scene["poster"])
 
 
-BAR_ORIGINALS = CONFIG_DIR / "bar-originals.json"
+def restart_waybar():
+    if have("omarchy-restart-waybar"):
+        run(["omarchy-restart-waybar"])
+    elif have("waybar"):
+        run(["pkill", "-x", "waybar"])
+        subprocess.Popen(["setsid", "uwsm-app", "--", "waybar"],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def write_bar(palette):
-    """Merge our keys into ~/.config/omarchy/shell.toml, leaving everything else alone.
-    Values of the user's own that we override are remembered and put back when matching is off."""
-    lines = SHELL_TOML.read_text().splitlines() if SHELL_TOML.exists() else []
-    originals = read_json(BAR_ORIGINALS, {})
-    sections, order, cur, ours_block = {"": []}, [""], "", False
-    for line in lines:
-        m = re.match(r"^\[([A-Za-z0-9_-]+)\]\s*$", line)
-        if m:
-            cur, ours_block = m.group(1), False
-            if cur not in sections:
-                sections[cur] = []
-                order.append(cur)
-            continue
-        if line.strip() == BAR_MARK:
-            ours_block = True
-            continue
-        if not line.strip():
-            ours_block = False
-        key = re.match(r"^\s*([A-Za-z0-9_-]+)\s*=", line)
-        if key and key.group(1) in MANAGED_KEYS.get(cur, []):
-            if not ours_block:  # the user's own value: remember it before we take the key over
-                originals.setdefault(f"{cur}.{key.group(1)}", line)
-            continue
-        sections[cur].append(line)
-
-    if not palette:  # matching off: give the user's own values back
-        for full, line in originals.items():
-            sec = full.split(".", 1)[0]
-            if sec not in sections:
-                sections[sec] = []
-                order.append(sec)
-            sections[sec].append(line)
-        BAR_ORIGINALS.unlink(missing_ok=True)
-    elif originals:
-        write_json(BAR_ORIGINALS, originals)
-
+    """(Re)write WAYBAR_CSS -- @define-color background/foreground when matching, an
+    empty (commented) file when not, so waybar falls back to the theme's own colours."""
     if palette:
-        p = palette
-        border = p.get("border") or [p["active"], p["active"]]
-        q = lambda h: '"#%s"' % h.lstrip("#")
-        ours = {
-            "bar": [("background", q(p["background"])), ("background-alpha", p.get("alpha", 0.85)),
-                    ("text", q(p["text"])), ("active", q(p["active"]))],
-            "popups": [("background", q(p["background"])), ("background-alpha", 0.95), ("text", q(p["text"])),
-                       ("border", '"rgba(%sff) rgba(%sff) 45deg"' % (border[0].lstrip("#"), border[1].lstrip("#"))),
-                       ("border-alpha", 1.0)],
-            "tooltip": [("background", q(p["background"])), ("background-alpha", 0.95), ("text", q(p["text"])),
-                        ("border", q(border[0]))],
-            "menu": [("selected-text", q(p["active"])), ("selected-border", q(border[0]))],
-            "launcher": [("selected-text", q(p["active"])), ("selected-border", q(border[0]))],
-        }
-        for sec, kvs in ours.items():
-            if sec not in sections:
-                sections[sec] = []
-                order.append(sec)
-            body = [l for l in sections[sec]]
-            while body and not body[-1].strip():
-                body.pop()
-            sections[sec] = body + [BAR_MARK] + [f"{k} = {v}" for k, v in kvs] + [""]
-
-    out = []
-    for sec in order:
-        body = sections[sec]
-        if sec and not any(l.strip() and not l.strip().startswith("#") for l in body):
-            continue  # section now empty
-        if sec:
-            if out and out[-1].strip():
-                out.append("")
-            out.append(f"[{sec}]")
-        out.extend(body)
-    text = "\n".join(out).strip() + "\n"
-    if not SHELL_TOML.exists() or SHELL_TOML.read_text() != text:
-        SHELL_TOML.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SHELL_TOML.with_suffix(".toml.tmp")
-        tmp.write_text(text)
-        tmp.replace(SHELL_TOML)  # the shell hot-reloads this file
+        text = ("/* written by omarchy-live-wallpaper -- do not edit by hand */\n"
+                 f"@define-color background #{palette['background'].lstrip('#')};\n"
+                 f"@define-color foreground #{palette['text'].lstrip('#')};\n")
+    else:
+        text = "/* omarchy-live-wallpaper: bar matching is off */\n"
+    if WAYBAR_CSS.exists() and WAYBAR_CSS.read_text() == text:
+        return
+    WAYBAR_CSS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WAYBAR_CSS.with_suffix(".css.tmp")
+    tmp.write_text(text)
+    tmp.replace(WAYBAR_CSS)
+    restart_waybar()  # waybar's reload_style_on_change doesn't reliably follow @imports
 
 
 def sync_bar(cfg, scene):
@@ -702,7 +644,7 @@ def cmd_packs(args):
 
 def cmd_doctor(args):
     ok = True
-    for c in ("mpvpaper", "ffmpeg", "hyprctl", "omarchy-shell"):
+    for c in ("mpvpaper", "ffmpeg", "hyprctl", "waybar", "walker"):
         found = have(c)
         ok &= found
         print(f"{'✓' if found else '✗'} {c}")
@@ -717,7 +659,28 @@ def cmd_doctor(args):
 
 
 def cmd_pick(args):
-    os.execvp("omarchy-shell", ["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"])
+    """Text picker (no Quickshell overlay here): a walker dmenu list of every scene
+    plus Auto, dispatched the same as `set` / `auto`."""
+    if not have("walker"):
+        die("walker not found; pick a scene directly, e.g.: live-wallpaper set madinah")
+    state = load_state()
+    pinned = state.get("pinned")
+    cur = state.get("current")
+    labels = {}
+    lines = []
+    for s in all_scenes():
+        mark = "  ✓" if pinned and s["id"] == cur else ""
+        line = f"{s['packLabel']} — {s['label']}{mark}"
+        labels[line] = s["id"]
+        lines.append(line)
+    auto_line = "Auto (follow schedule)" + ("  ✓" if not pinned else "")
+    lines.append(auto_line)
+    r = run(["walker", "--dmenu", "-p", "Live wallpaper…"], input="\n".join(lines))
+    choice = r.stdout.strip()
+    if choice == auto_line:
+        cmd_auto([])
+    elif choice in labels:
+        cmd_set([labels[choice]])
 
 
 def main(argv):

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Removes everything install.sh added. Your config and your own packs in
+# Removes everything install.sh (legacy port) added. Your config and your own packs in
 # ~/.config/omarchy-live-wallpaper are kept unless you pass --purge.
 #
 #   ~/.local/share/omarchy-live-wallpaper/uninstall.sh [--purge]
 
 set -uo pipefail
 
-INSTALL_DIR="${LW_INSTALL_DIR:-$HOME/.local/share/omarchy-live-wallpaper}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-live-wallpaper"
-PLUGIN_ID="io.github.vienjunaid.live-wallpaper"
 BIN="$HOME/.local/bin/live-wallpaper"
+WAYBAR_STYLE="$HOME/.config/waybar/style.css"
+AUTOSTART="$HOME/.config/hypr/autostart.conf"
+MENU_EXT="$HOME/.config/omarchy/extensions/menu.sh"
 MARK_BEGIN=">>> omarchy-live-wallpaper"
 MARK_END="<<< omarchy-live-wallpaper"
 STAMP="$(date +%s)"
@@ -31,30 +32,22 @@ PY
   say "Cleaned $1"
 }
 
-# Bar colours back to the theme's (and any values of yours we had replaced).
-[[ -x $BIN ]] && "$BIN" bar clear >/dev/null 2>&1 && say "Restored the bar colours"
+# Bar colours back to the theme's, and waybar restarted to drop the override.
+[[ -x $BIN ]] && "$BIN" bar clear >/dev/null 2>&1
+command -v omarchy-restart-waybar >/dev/null && omarchy-restart-waybar >/dev/null 2>&1 \
+  || { pkill -x waybar 2>/dev/null; setsid uwsm-app -- waybar >/dev/null 2>&1 & disown; }
+say "Restored the bar colours"
 
 [[ -x $BIN ]] && "$BIN" stop --all
 pkill -x mpvpaper 2>/dev/null && say "Stopped mpvpaper"
 
-omarchy-shell shell hide "$PLUGIN_ID" >/dev/null 2>&1
-omarchy-shell shell setPluginEnabled "$PLUGIN_ID" false >/dev/null 2>&1
-rm -rf "$HOME/.config/omarchy/plugins/$PLUGIN_ID" && say "Removed the picker plugin"
-
-if [[ -f $CONFIG_DIR/.disabled-omarchy-background ]]; then
-  omarchy-shell shell setPluginEnabled omarchy.background true >/dev/null 2>&1
-  rm -f "$CONFIG_DIR/.disabled-omarchy-background"
-  say "Turned Omarchy's normal background back on"
-fi
-
-strip_block "$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
-strip_block "$HOME/.config/hypr/autostart.lua"
-strip_block "$HOME/.config/hypr/autostart.conf"
+strip_block "$WAYBAR_STYLE"
+strip_block "$MENU_EXT"
+strip_block "$AUTOSTART"
 
 [[ -L $BIN ]] && rm -f "$BIN" && say "Removed $BIN"
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-live-wallpaper" "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-live-wallpaper" \
   "${XDG_RUNTIME_DIR:-/tmp}/omarchy-live-wallpaper"
-[[ -d $INSTALL_DIR/.git ]] && rm -rf "$INSTALL_DIR" && say "Removed $INSTALL_DIR"
 
 if $PURGE; then
   rm -rf "$CONFIG_DIR" && say "Removed $CONFIG_DIR (config and your own packs)"
